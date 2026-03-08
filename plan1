@@ -1,0 +1,116 @@
+1. 🔌 NATS Auth Callout Handler（最核心）
+NATS Auth Callout 的機制是：當 client 連線到 NATS server 時，NATS server 會把連線請求透過 NATS message 發到你指定的 auth callout service。你的 RBAC service 需要：
+
+訂閱 auth callout subject（例如 $SYS.REQ.USER.AUTH）
+解析 NATS 傳來的 Authorization Request（JWT claim request）
+查詢使用者的角色與權限（呼叫現有的 
+
+CheckPermission
+ / 
+
+GetUserRoles
+ 等 service 方法）
+簽發 User JWT，在裡面帶上 NATS permissions（publish/subscribe 哪些 subjects）
+這需要用 nkeys 來簽署 JWT
+根據使用者的 RBAC 角色動態產生對應的 NATS subject 權限
+FE Client
+   │
+   ▼ (connect with credentials)
+NATS Server
+   │
+   ▼ (auth callout request)
+RBAC Service (subscribes to $SYS.REQ.USER.AUTH)
+   │
+   ├── 驗證身分 (e.g., JWT token / API key)
+   ├── 查詢 user roles (現有邏輯)
+   ├── 映射 RBAC 角色 → NATS subject permissions
+   └── 回傳簽署的 User JWT → NATS Server
+   │
+   ▼ (connection granted with permissions)
+FE Client ←→ NATS Server
+2. 📡 NATS Request-Reply Handlers（取代 HTTP API）
+目前所有 HTTP endpoints 都需要有對應的 NATS subject handler，用 Request-Reply 模式：
+
+現有 HTTP API	NATS Subject（範例）
+POST /permissions/check	rbac.permissions.check
+POST /permissions/check/batch	rbac.permissions.check.batch
+POST /user_roles/owner	rbac.system.assign_owner
+PUT /user_roles/owner	rbac.system.transfer_owner
+POST /user_roles	rbac.system.assign_role
+DELETE /user_roles	rbac.system.delete_role
+GET /user_roles/me	rbac.system.get_my_roles
+GET /user_roles	rbac.system.get_members
+POST /user_roles/resources/owner	rbac.resource.assign_owner
+...	...
+每個 handler 需要：
+
+從 NATS message 的 payload 反序列化 request（JSON）
+從 NATS connection context 或 message header 取得 callerID
+呼叫現有的 service 層方法（邏輯不用改）
+序列化 response 回傳
+3. 🔐 RBAC 角色 → NATS Permissions 映射層（新增）
+這是 Auth Callout 最關鍵的部分 — 你需要新增一個映射邏輯：
+
+go
+// 例如：根據 RBAC 角色產生 NATS subject permissions
+func MapRolesToNATSPermissions(roles []*model.UserRole) NATSPermissions {
+    perms := NATSPermissions{}
+    for _, role := range roles {
+        switch {
+        case role.Scope == "system" && role.Role == "owner":
+            // 可以 publish/subscribe namespace 底下所有 subjects
+            perms.Publish.Allow = append(perms.Publish.Allow, 
+                fmt.Sprintf("rbac.%s.>", role.Namespace))
+            perms.Subscribe.Allow = append(perms.Subscribe.Allow,
+                fmt.Sprintf("rbac.%s.>", role.Namespace))
+        case role.Scope == "system" && role.Role == "viewer":
+            // 只能 subscribe / 發 read 請求
+            perms.Subscribe.Allow = append(perms.Subscribe.Allow,
+                fmt.Sprintf("rbac.%s.read.>", role.Namespace))
+        // ... 其他角色映射
+        }
+    }
+    return perms
+}
+4. 🏗️ 需要新增的元件與修改
+新增元件
+元件	說明
+NATS connection manager	管理 NATS 連線、重連、心跳
+Auth Callout handler	處理 $SYS.REQ.USER.AUTH 請求
+NATS message handlers	取代 HTTP handler，對接現有 service 層
+RBAC→NATS permissions mapper	角色到 NATS subject 權限的映射邏輯
+NKey/JWT 管理	用於 Auth Callout 簽署 user JWT
+Config 擴充	NATS URL, NKey seed, account signing key 等
+現有 service 層（不需要大改）
+你目前的架構分層很清楚：Handler → Service → Repository。Service 和 Repository 層可以原封不動地被 NATS handlers 複用，只需要在 handler 層做一個平行的 NATS transport。
+
+建議的新專案結構
+rbac7/
+├── cmd/server/main.go          # 修改：同時啟動 HTTP + NATS
+├── internal/rbac/
+│   ├── handler/                # 現有 HTTP handler (保留)
+│   ├── nats/                   # 【新增】NATS 相關
+│   │   ├── connection.go       # NATS 連線管理
+│   │   ├── auth_callout.go     # Auth Callout handler
+│   │   ├── handlers.go         # NATS request-reply handlers
+│   │   ├── permissions_map.go  # RBAC→NATS permissions 映射
+│   │   └── jwt_signer.go       # NKey JWT 簽署
+│   ├── config/config.go        # 修改：新增 NATS 相關設定
+│   ├── service/                # 不動
+│   ├── repository/             # 不動
+│   └── policy/                 # 不動
+5. ⚠️ 需要特別注意的事項
+Auth Callout 中的權限粒度設計 — NATS 的 subject-based permissions 和你現有的 RBAC policy 模型粒度不完全一致，需要仔細設計映射規則
+連線時權限 vs 請求時權限 — NATS Auth Callout 是在連線時決定權限；但你現有 RBAC middleware 是每次請求時動態檢查。如果角色在連線後改變，你需要考慮：
+用短期 JWT + 強制重連
+或在 NATS handler 裡仍然做 request-level 的權限檢查（更安全）
+NATS JetStream — 如果以後要做事件驅動（例如角色變更通知），可以考慮用 JetStream 做 event streaming
+向後相容 — 建議先同時保留 HTTP + NATS 雙通道，逐步遷移
+總結
+工作項目	複雜度	說明
+NATS Auth Callout handler	⭐⭐⭐⭐	核心，需處理 JWT 簽署和權限映射
+NATS message handlers	⭐⭐	相對簡單，套用現有 service 層
+RBAC→NATS permissions 映射	⭐⭐⭐⭐	設計決策多，需仔細考慮粒度
+NKey/JWT 管理	⭐⭐⭐	安全敏感，需妥善管理密鑰
+Config 擴充	⭐	增加環境變數
+main.go 修改	⭐⭐	同時啟動 HTTP + NATS
